@@ -110,9 +110,22 @@ type BranchProjection = (types: ReadonlyArray<Type>) =>
   | ((val: unknown) => number)
   | undefined;
 
+interface IgnoredLogicalTypeInfo {
+  /** Name of the ignored logical type. */
+  logicalType: string;
+  /** Why the logical type was ignored. */
+  reason: 'unregistered' | 'invalid';
+  /** Schema which declared the logical type. */
+  schema: Schema;
+  /** Error which caused a registered logical type to be ignored, if any. */
+  error?: Error;
+}
+
 interface ForSchemaOptions {
   assertLogicalTypes: boolean;
-  logicalTypes: { [type: string]: new (schema: Schema, opts?: any) => types.LogicalType; };
+  logicalTypes: { [type: string]: (new (schema: Schema, opts?: any) => types.LogicalType) | null; };
+  logicalTypeHook: ((info: IgnoredLogicalTypeInfo) => void) | undefined;
+  logicalTypeWarnings: boolean;
   namespace: string;
   noAnonymousTypes: boolean;
   omitRecordMethods: boolean;
@@ -287,6 +300,12 @@ export namespace types {
     protected _resolve(type: Type): any;
     protected _toValue(any: any): any;
     random(): unknown;
+  }
+
+  /** Built-in `uuid` logical type. */
+  class UuidType extends LogicalType {
+    constructor(schema: Schema, opts?: any);
+    random(): string;
   }
 
   class LongType extends Type {

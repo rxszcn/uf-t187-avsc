@@ -9,6 +9,7 @@ let types = require('../lib/types'),
 let Buffer = buffer.Buffer;
 
 let LogicalType = types.builtins.LogicalType;
+let UuidType = types.builtins.UuidType;
 let Tap = utils.Tap;
 let Type = types.Type;
 let builtins = types.builtins;
@@ -2782,6 +2783,82 @@ suite('types', () => {
       });
     });
 
+    test('unregistered logical type signal', () => {
+      // Silent fallback is the spec-mandated behavior, but we must be able to
+      // observe it both programmatically and via warnings.
+      let infos = [];
+      let opts = {logicalTypeHook: (info) => { infos.push(info); }};
+      let t = Type.forSchema({type: 'long', logicalType: 'unknown'}, opts);
+      assert(t instanceof builtins.LongType);
+      assert.equal(infos.length, 1);
+      assert.equal(infos[0].logicalType, 'unknown');
+      assert.equal(infos[0].reason, 'unregistered');
+      assert.deepEqual(infos[0].schema, {type: 'long', logicalType: 'unknown'});
+      assert.strictEqual(infos[0].error, undefined);
+
+      // An invalid registered logical type is reported as such.
+      infos.length = 0;
+      let invalid = Type.forSchema(
+        {type: 'int', logicalType: 'date'},
+        {logicalTypes: {date: DateType}, logicalTypeHook: (info) => {
+          infos.push(info);
+        }}
+      );
+      assert(invalid instanceof builtins.IntType);
+      assert.equal(infos.length, 1);
+      assert.equal(infos[0].reason, 'invalid');
+      assert(infos[0].error instanceof Error);
+
+      // Warnings are emitted at most once per name, and can be turned off.
+      let warnings = [];
+      let warn = console.warn;
+      console.warn = (msg) => { warnings.push(msg); };
+      try {
+        Type.forSchema(
+          {type: 'long', logicalType: 'warned-once'},
+          {logicalTypeHook: undefined}
+        );
+        Type.forSchema(
+          {type: 'long', logicalType: 'warned-once'},
+          {logicalTypeHook: undefined}
+        );
+      } finally {
+        console.warn = warn;
+      }
+      assert.equal(warnings.length, 1);
+      assert(/warned-once/.test(warnings[0]));
+
+      warnings.length = 0;
+      console.warn = (msg) => { warnings.push(msg); };
+      try {
+        Type.forSchema(
+          {type: 'long', logicalType: 'no-warn'},
+          {logicalTypeWarnings: false}
+        );
+      } finally {
+        console.warn = warn;
+      }
+      assert.equal(warnings.length, 0);
+
+      // Disabling a logical type explicitly shouldn't emit a signal either.
+      infos.length = 0;
+      Type.forSchema(
+        {type: 'string', logicalType: 'uuid'},
+        {logicalTypes: {uuid: null}, logicalTypeHook: (info) => {
+          infos.push(info);
+        }}
+      );
+      assert.equal(infos.length, 0);
+
+      // Strict mode turns the fallback into a hard error.
+      assert.throws(() => {
+        Type.forSchema(
+          {type: 'long', logicalType: 'unknown'},
+          {assertLogicalTypes: true}
+        );
+      }, /unknown logical type/);
+    });
+
     test('missing type', () => {
       let t = Type.forSchema({
         type: 'long',
@@ -3213,6 +3290,234 @@ suite('types', () => {
 
       });
 
+    });
+
+  });
+
+  suite('UuidType', () => {
+
+    let UUID = '0123abcd-4567-89ab-cdef-0123456789ab';
+    let UUID_BYTES = new Uint8Array([
+      0x01, 0x23, 0xab, 0xcd, 0x45, 0x67, 0x89, 0xab,
+      0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab
+    ]);
+
+    test('string form', () => {
+      let t = Type.forSchema({type: 'string', logicalType: 'uuid'});
+      assert(t instanceof UuidType);
+      assert.equal(t.typeName, 'logical:uuid');
+      assert(t.getUnderlyingType() instanceof builtins.StringType);
+      assert(t.isValid(UUID));
+      assert(t.isValid(UUID.toUpperCase())); // Valid, though not canonical.
+      assert(!t.isValid(UUID.replace('0123', '012')));
+      assert(!t.isValid(UUID.replace(/-/g, '')));
+      assert(!t.isValid('not-a-uuid'));
+      assert(!t.isValid(123));
+      assert(!t.isValid(null));
+      assert(t.equals(t));
+      assert.equal(t.getSchema(), 'string');
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(t.getSchema({exportAttrs: true}))),
+        {type: 'string', logicalType: 'uuid'}
+      );
+    });
+
+    test('roundtrip canonicalizes', () => {
+      let t = Type.forSchema({type: 'string', logicalType: 'uuid'});
+      let upper = UUID.toUpperCase();
+      assert.equal(t.fromBuffer(t.toBuffer(upper)), UUID);
+      assert.equal(t.clone(upper), UUID);
+      assert.equal(t.fromString(JSON.stringify(upper)), UUID);
+      assert.equal(t.toString(upper), JSON.stringify(UUID));
+      assert.equal(t.compare(UUID, upper), 0);
+      assert(t.isValid(t.random()));
+    });
+
+    test('fixed form', () => {
+      let t = Type.forSchema({
+        name: 'Uuid',
+        type: 'fixed',
+        size: 16,
+        logicalType: 'uuid'
+      });
+      assert(t instanceof UuidType);
+      assert(t.getUnderlyingType() instanceof builtins.FixedType);
+      assert(t.isValid(UUID));
+      assert(t.isValid(UUID_BYTES));
+      assert(!t.isValid(new Uint8Array(15)));
+      assert(!t.isValid(new Uint8Array(17)));
+      let buf = t.toBuffer(UUID);
+      assert.deepEqual(buf, UUID_BYTES);
+      assert.equal(t.fromBuffer(buf), UUID);
+      assert.deepEqual(t.toBuffer(UUID_BYTES), UUID_BYTES);
+      assert.deepEqual(
+        JSON.parse(JSON.stringify(t.getSchema({exportAttrs: true}))),
+        {name: 'Uuid', type: 'fixed', size: 16, logicalType: 'uuid'}
+      );
+      // Without attributes we only get the underlying type.
+      assert.deepEqual(
+        t.getSchema(),
+        {name: 'Uuid', type: 'fixed', size: 16}
+      );
+    });
+
+    test('invalid underlying types', () => {
+      let opts = {logicalTypeWarnings: false};
+      assert.equal(
+        Type.forSchema({type: 'int', logicalType: 'uuid'}, opts).typeName,
+        'int'
+      );
+      assert.equal(
+        Type.forSchema({
+          name: 'Bad',
+          type: 'fixed',
+          size: 4,
+          logicalType: 'uuid'
+        }, opts).typeName,
+        'fixed'
+      );
+      assert.equal(
+        Type.forSchema({type: 'bytes', logicalType: 'uuid'}, opts).typeName,
+        'bytes'
+      );
+      // With assertions enabled, the failure is surfaced instead.
+      assert.throws(() => {
+        Type.forSchema({
+          type: 'int',
+          logicalType: 'uuid'
+        }, Object.assign({assertLogicalTypes: true}, opts));
+      }, /uuid/);
+    });
+
+    test('invalid values', () => {
+      let t = Type.forSchema({type: 'string', logicalType: 'uuid'});
+      assert.throws(() => { t.toBuffer('nope'); }, /uuid/);
+      assert.throws(() => { t.clone('nope'); });
+      assert.throws(() => { t.fromString('"nope"'); });
+      // Malformed values can't be decoded either.
+      let strType = Type.forSchema('string');
+      assert.throws(() => { t.fromBuffer(strType.toBuffer('nope')); }, /uuid/);
+      let hasError = false;
+      t.isValid('nope', {errorHook: function (path, any, type) {
+        hasError = true;
+        assert.equal(any, 'nope');
+        assert(type instanceof UuidType);
+      }});
+      assert(hasError);
+    });
+
+    test('in unions', () => {
+      let uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+      let nullUuid = Type.forSchema(['null', {
+        type: 'string', logicalType: 'uuid'
+      }]);
+      assert(nullUuid.isValid(null));
+      assert(nullUuid.isValid(uuid));
+      assert(!nullUuid.isValid('nope'));
+      assert.equal(nullUuid.fromBuffer(nullUuid.toBuffer(uuid)), uuid);
+
+      let wrapped = Type.forSchema([
+        'null', {type: 'string', logicalType: 'uuid'}
+      ], {wrapUnions: true});
+      assert(wrapped.isValid(null));
+      assert(wrapped.isValid({string: uuid}));
+      assert(!wrapped.isValid({string: 'nope'}));
+      assert.deepEqual(
+        wrapped.fromBuffer(wrapped.toBuffer({string: uuid})),
+        {string: uuid}
+      );
+      // A UUID branch can't be distinguished from a plain string branch, so
+      // such unions are rejected (same as for other logical types).
+      assert.throws(() => {
+        Type.forSchema(['string', {type: 'string', logicalType: 'uuid'}]);
+      }, /duplicate/);
+    });
+
+    test('schema resolution', () => {
+      let uuidType = Type.forSchema({type: 'string', logicalType: 'uuid'});
+      let fixedUuidType = Type.forSchema({
+        name: 'Uuid',
+        type: 'fixed',
+        size: 16,
+        logicalType: 'uuid'
+      });
+      let strType = Type.forSchema('string');
+      let fixedType = Type.forSchema({name: 'Uuid', type: 'fixed', size: 16});
+
+      let resolver = uuidType.createResolver(strType);
+      assert.equal(uuidType.fromBuffer(strType.toBuffer(UUID), resolver), UUID);
+
+      resolver = strType.createResolver(uuidType);
+      assert.equal(strType.fromBuffer(uuidType.toBuffer(UUID), resolver), UUID);
+
+      resolver = uuidType.createResolver(uuidType);
+      let uuidBuf = uuidType.toBuffer(UUID);
+      assert.equal(uuidType.fromBuffer(uuidBuf, resolver), UUID);
+
+      resolver = fixedUuidType.createResolver(fixedType);
+      assert.equal(
+        fixedUuidType.fromBuffer(fixedType.toBuffer(UUID_BYTES), resolver),
+        UUID
+      );
+
+      resolver = fixedType.createResolver(fixedUuidType);
+      assert.deepEqual(
+        fixedType.fromBuffer(fixedUuidType.toBuffer(UUID), resolver),
+        UUID_BYTES
+      );
+
+      // Incompatible underlying types are still rejected.
+      assert.throws(() => { uuidType.createResolver(Type.forSchema('int')); });
+      assert.throws(() => {
+        uuidType.createResolver(fixedType);
+      });
+      assert.throws(() => {
+        fixedUuidType.createResolver(Type.forSchema({
+          name: 'Other', type: 'fixed', size: 4
+        }));
+      });
+      assert.throws(() => {
+        fixedUuidType.createResolver(strType);
+      });
+
+      // Records mixing logical and plain fields.
+      let writer = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [{name: 'id', type: 'string'}]
+      });
+      let reader = Type.forSchema({
+        type: 'record',
+        name: 'R',
+        fields: [{name: 'id', type: {type: 'string', logicalType: 'uuid'}}]
+      });
+      let recResolver = reader.createResolver(writer);
+      let buf = writer.toBuffer({id: UUID.toUpperCase()});
+      assert.deepEqual(reader.fromBuffer(buf, recResolver), {id: UUID});
+      // Non-UUID strings are left untouched rather than rejected, since
+      // logical types are ignored during resolution.
+      buf = writer.toBuffer({id: 'legacy-id'});
+      assert.deepEqual(reader.fromBuffer(buf, recResolver), {id: 'legacy-id'});
+    });
+
+    test('can be overridden or disabled', () => {
+      class NoopUuid extends LogicalType {
+        _fromValue (val) { return val; }
+        _toValue (val) { return val; }
+      }
+      let t = Type.forSchema(
+        {type: 'string', logicalType: 'uuid'},
+        {logicalTypes: {uuid: NoopUuid}}
+      );
+      assert(t instanceof NoopUuid);
+      assert(!(t instanceof UuidType));
+
+      let disabled = Type.forSchema(
+        {type: 'string', logicalType: 'uuid'},
+        {logicalTypes: {uuid: null}}
+      );
+      assert(disabled instanceof builtins.StringType);
+      assert.equal(disabled.typeName, 'string');
     });
 
   });

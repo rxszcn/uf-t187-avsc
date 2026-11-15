@@ -5,6 +5,7 @@ if (process.browser) {
 }
 
 let specs = require('../lib/specs'),
+    types = require('../lib/types'),
     assert = require('assert'),
     path = require('path');
 
@@ -631,7 +632,11 @@ suite('specs', () => {
     // Import hook from strings.
     function createImportHook(imports) {
       return function ({path: fpath, importerPath}, cb) {
-        let key = path.normalize(path.join(path.dirname(importerPath), fpath));
+        // Keys are written with forward slashes; normalize separators so that
+        // the fixtures also resolve on Windows.
+        let key = path
+          .normalize(path.join(path.dirname(importerPath), fpath))
+          .split(path.sep).join('/');
         let str = imports[key];
         delete imports[key];
         process.nextTick(() => { cb(null, typeof str === 'string' ? {
@@ -770,6 +775,137 @@ suite('specs', () => {
       assert.deepEqual(usingQuestionMark, usingUnion);
     });
 
+    test('uuid type ref', () => {
+      assert.deepEqual(
+        readSchema('record { uuid id; uuid? alt; }'),
+        {
+          type: 'record',
+          fields: [
+            {type: {type: 'string', logicalType: 'uuid'}, name: 'id'},
+            {
+              type: [
+                'null',
+                {type: 'string', logicalType: 'uuid'}
+              ],
+              name: 'alt'
+            }
+          ]
+        }
+      );
+    });
+
+    test('uuid type ref overwrite attributes', () => {
+      // Annotations are merged into the referenced type, as for other type
+      // refs (see the `ip` test above).
+      assert.deepEqual(
+        readSchema('record { @foo("bar") uuid id; }'),
+        {
+          type: 'record',
+          fields: [
+            {
+              type: {type: 'string', logicalType: 'uuid', foo: 'bar'},
+              name: 'id'
+            }
+          ]
+        }
+      );
+    });
+
+    test('uuid type ref supports explicit annotation', () => {
+      assert.deepEqual(
+        readSchema('record { @logicalType("uuid") uuid id; }'),
+        {
+          type: 'record',
+          fields: [{type: {type: 'string', logicalType: 'uuid'}, name: 'id'}]
+        }
+      );
+    });
+
+    test('uuid: IDL and explicit schema instantiate identically', () => {
+      let Type = types.Type;
+      let uuidSchema = {type: 'string', logicalType: 'uuid'};
+      let cases = [
+        {
+          idl: 'record { uuid id; }',
+          explicit: {
+            type: 'record',
+            fields: [{name: 'id', type: uuidSchema}]
+          },
+          underlying: 'string'
+        },
+        {
+          idl: 'record { uuid? id; }',
+          explicit: {
+            type: 'record',
+            fields: [{name: 'id', type: ['null', uuidSchema]}]
+          },
+          optional: true,
+          underlying: 'string'
+        },
+        {
+          idl: 'record { union{null,uuid} id; }',
+          explicit: {
+            type: 'record',
+            fields: [{name: 'id', type: ['null', uuidSchema]}]
+          },
+          optional: true,
+          underlying: 'string'
+        },
+        {
+          idl: 'record { @logicalType("uuid") fixed Uid(16) id; }',
+          explicit: {
+            type: 'record',
+            fields: [{
+              name: 'id',
+              type: {
+                name: 'Uid',
+                type: 'fixed',
+                size: 16,
+                logicalType: 'uuid'
+              }
+            }]
+          },
+          underlying: 'fixed'
+        }
+      ];
+      let uuid = '0123abcd-4567-89ab-cdef-0123456789ab';
+      cases.forEach((elem) => {
+        // The IDL front end must emit exactly the explicit schema.
+        assert.deepEqual(readSchema(elem.idl), elem.explicit);
+        let fromIdl = Type.forSchema(readSchema(elem.idl));
+        let fromExplicit = Type.forSchema(elem.explicit);
+        let exportAttrs = {exportAttrs: true};
+        assert.deepEqual(
+          JSON.parse(JSON.stringify(fromIdl.getSchema(exportAttrs))),
+          JSON.parse(JSON.stringify(fromExplicit.getSchema(exportAttrs)))
+        );
+        assert(fromIdl.equals(fromExplicit, {strict: true}));
+
+        let fieldType = fromIdl.field('id').getType();
+        let uuidType = elem.optional ? fieldType.getTypes()[1] : fieldType;
+        assert.equal(uuidType.typeName, 'logical:uuid');
+        assert.equal(uuidType.getUnderlyingType().typeName, elem.underlying);
+
+        let values = [uuid, uuid.toUpperCase()];
+        if (elem.underlying === 'fixed') {
+          values.push(new Uint8Array(16).fill(0x2a));
+        }
+        if (elem.optional) {
+          values.push(null);
+        }
+        values.forEach((value) => {
+          let val = {id: value};
+          assert(fromIdl.isValid(val));
+          assert(fromExplicit.isValid(val));
+          // Both entry points must produce the same canonical value.
+          assert.deepEqual(
+            fromIdl.fromBuffer(fromIdl.toBuffer(val)),
+            fromExplicit.fromBuffer(fromExplicit.toBuffer(val))
+          );
+        });
+      });
+    });
+
   });
 
   suite('readProtocol', () => {
@@ -793,6 +929,40 @@ suite('specs', () => {
       assert.throws(() => {
         readProtocol('protocol { import idl "Foo.avdl"; }');
       }, /unresolvable/);
+    });
+
+    test('uuid in messages', () => {
+      let Type = types.Type;
+      let protocol = readProtocol(
+        'protocol UuidProtocol { ' +
+        'record Ping { uuid id; } ' +
+        'Ping ping(Ping p); ' +
+        '}'
+      );
+      assert.deepEqual(protocol.types[0].fields[0].type, {
+        type: 'string',
+        logicalType: 'uuid'
+      });
+      // Both the declared type and the message request/response types
+      // instantiate with the UUID logical type (names resolve via the
+      // shared registry).
+      let registry = {};
+      let recordType = Type.forSchema(protocol.types[0], {registry});
+      assert.equal(
+        recordType.field('id').getType().typeName,
+        'logical:uuid'
+      );
+      let message = protocol.messages.ping;
+      let responseType = Type.forSchema(message.response, {registry});
+      assert.equal(
+        responseType.field('id').getType().typeName,
+        'logical:uuid'
+      );
+      let requestType = Type.forSchema(message.request[0].type, {registry});
+      assert.equal(
+        requestType.field('id').getType().typeName,
+        'logical:uuid'
+      );
     });
   });
 
